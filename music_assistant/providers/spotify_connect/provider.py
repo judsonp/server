@@ -1189,8 +1189,15 @@ class SpotifyConnectProvider(PluginProvider):
             return
         previous_volume = daemon.last_volume_sent
         daemon.last_volume_sent = volume
+        player = self.mass.players.get_player(daemon.in_use_by_player)
         try:
-            await self.mass.players.cmd_volume_set(daemon.in_use_by_player, volume)
+            if player is not None and player.state.volume_level is None:
+                # mirror _sync_player_volume_to_spotify: a player without a level of its
+                # own (such as a sync leader whose members carry the volume) is
+                # commanded through its group volume
+                await self.mass.players.cmd_group_volume(daemon.in_use_by_player, volume)
+            else:
+                await self.mass.players.cmd_volume_set(daemon.in_use_by_player, volume)
         except Exception as err:
             # Volume sync is best-effort: the player may not support volume, or the
             # command may fail. Restore the cached value so a retry isn't wrongly

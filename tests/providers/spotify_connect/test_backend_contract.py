@@ -454,6 +454,21 @@ async def test_volume_event_applies_with_dedupe_and_grace() -> None:
     assert daemon.last_volume_sent == 45
 
 
+async def test_volume_event_uses_group_volume_for_player_without_own_volume() -> None:
+    """A player with no volume of its own (e.g. a receiver whose zones carry it) gets group volume."""
+    backend = FakeBackend()
+    provider, daemon, mass = _make_provider(backend, in_use_by_queue="queue1", last_volume_sent=30)
+    mass.players.get_player.return_value.state.volume_level = None
+    mass.players.cmd_volume_set = AsyncMock()
+    mass.players.cmd_group_volume = AsyncMock()
+    daemon.last_session_active_time = time.time() - 10
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.VOLUME, volume=45))
+
+    mass.players.cmd_group_volume.assert_awaited_once_with("queue1", 45)
+    mass.players.cmd_volume_set.assert_not_awaited()
+
+
 async def test_session_inactive_stops_active_player() -> None:
     """A SESSION_INACTIVE event clears all claims and stops the active MA player."""
     backend = FakeBackend()
