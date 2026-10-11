@@ -436,6 +436,7 @@ async def test_volume_event_applies_with_dedupe_and_grace() -> None:
     """Volume events are deduped against echoes and gated by the activation grace period."""
     backend = FakeBackend()
     provider, daemon, mass = _make_provider(backend, in_use_by_queue="queue1", last_volume_sent=30)
+    mass.players.get_player.return_value.state.group_members = []
     mass.players.cmd_volume_set = AsyncMock()
 
     # echo of the value we just pushed ourselves: ignored
@@ -459,6 +460,23 @@ async def test_volume_event_uses_group_volume_for_player_without_own_volume() ->
     backend = FakeBackend()
     provider, daemon, mass = _make_provider(backend, in_use_by_queue="queue1", last_volume_sent=30)
     mass.players.get_player.return_value.state.volume_level = None
+    mass.players.cmd_volume_set = AsyncMock()
+    mass.players.cmd_group_volume = AsyncMock()
+    daemon.last_session_active_time = time.time() - 10
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.VOLUME, volume=45))
+
+    mass.players.cmd_group_volume.assert_awaited_once_with("queue1", 45)
+    mass.players.cmd_volume_set.assert_not_awaited()
+
+
+async def test_volume_event_uses_group_volume_for_sync_leader() -> None:
+    """Spotify's slider on a sync leader (e.g. a zone leading both zones) moves the group."""
+    backend = FakeBackend()
+    provider, daemon, mass = _make_provider(backend, in_use_by_queue="queue1", last_volume_sent=30)
+    state = mass.players.get_player.return_value.state
+    state.volume_level = 40
+    state.group_members = ["queue1", "queue2"]
     mass.players.cmd_volume_set = AsyncMock()
     mass.players.cmd_group_volume = AsyncMock()
     daemon.last_session_active_time = time.time() - 10

@@ -1191,10 +1191,7 @@ class SpotifyConnectProvider(PluginProvider):
         daemon.last_volume_sent = volume
         player = self.mass.players.get_player(daemon.in_use_by_player)
         try:
-            if player is not None and player.state.volume_level is None:
-                # mirror _sync_player_volume_to_spotify: a player without a level of its
-                # own (such as a sync leader whose members carry the volume) is
-                # commanded through its group volume
+            if player is not None and self._uses_group_volume(player):
                 await self.mass.players.cmd_group_volume(daemon.in_use_by_player, volume)
             else:
                 await self.mass.players.cmd_volume_set(daemon.in_use_by_player, volume)
@@ -1216,9 +1213,9 @@ class SpotifyConnectProvider(PluginProvider):
         if player is None:
             return
         volume_level = player.state.volume_level
-        if volume_level is None:
-            # a group has no level of its own, and the group volume is the level its
-            # own volume commands interpolate the members from
+        if self._uses_group_volume(player) and player.state.group_volume is not None:
+            # the group volume is the level group volume commands interpolate the
+            # members from
             volume_level = player.state.group_volume
         if volume_level is None:
             return
@@ -1263,3 +1260,13 @@ class SpotifyConnectProvider(PluginProvider):
         backend object exists.
         """
         return self.get_setup_value(CONF_BACKEND) == BACKEND_SOLOIST
+
+    @staticmethod
+    def _uses_group_volume(player: Player) -> bool:
+        """
+        Return True if Spotify's volume slider stands for the player's group volume.
+
+        That is the case for a sync leader, so the slider moves the whole group it plays
+        to, and for a player without a level of its own whose members carry the volume.
+        """
+        return player.state.volume_level is None or bool(player.state.group_members)

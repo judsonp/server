@@ -134,6 +134,7 @@ async def test_daemon_runner_reselects_api_port_when_taken(tmp_path: Path) -> No
 def _volume_sync_provider(
     volume_level: int | None,
     group_volume: int | None = None,
+    group_members: list[str] | None = None,
 ) -> tuple[SpotifyConnectProvider, _PlayerDaemon, AsyncMock]:
     """
     Build a minimal provider whose linked player reports the given volume.
@@ -141,6 +142,7 @@ def _volume_sync_provider(
     :param volume_level: The player's own volume level, None for a group.
     :param group_volume: The group volume, defaulting to the player's own level as it
         does for anything that is not a group.
+    :param group_members: The members the player leads, empty if it leads no group.
     """
     provider = object.__new__(SpotifyConnectProvider)
     provider.mass = MagicMock()
@@ -157,6 +159,7 @@ def _volume_sync_provider(
     player = MagicMock()
     player.state.volume_level = volume_level
     player.state.group_volume = volume_level if group_volume is None else group_volume
+    player.state.group_members = group_members or []
     provider.mass.players.get_player.return_value = player
     return provider, daemon, set_volume
 
@@ -202,15 +205,15 @@ async def test_sync_player_volume_pushes_group_volume_for_a_group() -> None:
     set_volume.assert_awaited_once_with(44)
 
 
-async def test_sync_player_volume_prefers_the_players_own_level_over_the_group() -> None:
-    """A sync leader is commanded on its own, so its own level is what the app must show."""
-    provider, daemon, set_volume = _volume_sync_provider(30, group_volume=60)
+async def test_sync_player_volume_pushes_group_volume_for_a_sync_leader() -> None:
+    """A sync leader's slider moves its whole group, so the group volume is what's shown."""
+    provider, daemon, set_volume = _volume_sync_provider(
+        30, group_volume=60, group_members=["player1", "player2"]
+    )
 
     await provider._sync_player_volume_to_spotify(daemon, "player1")
 
-    # cmd_volume_set only redirects a PlayerType.GROUP, so a leader is commanded on its
-    # own and pushing its group's 60 would send the first press to ~62
-    set_volume.assert_awaited_once_with(30)
+    set_volume.assert_awaited_once_with(60)
 
 
 async def test_sync_player_volume_skips_a_group_with_no_powered_members() -> None:
