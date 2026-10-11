@@ -37,6 +37,11 @@ DEFAULT_PLAYBACK_TRANSITION_TIMEOUT: Final = 5
 # HEOS can sit in stop for several seconds while it restarts on a new stream (e.g. a group skip)
 PLAYBACK_TRANSITION_STOP_GRACE: Final = 10
 
+CONF_AVR_ZONES: Final[str] = "avr_zones"
+# zone player id is {heos_player_id}{AVR_ZONE_SPLITTER}{zone}
+AVR_ZONE_SPLITTER: Final = "___"
+AVR_ZONE_POLL_INTERVAL: Final = 10
+
 CONNECT_MAX_ATTEMPTS: Final = 3
 CONNECT_INITIAL_RETRY_DELAY: Final = 5
 CONNECT_RETRY_BACKOFF_FACTOR: Final = 1.5

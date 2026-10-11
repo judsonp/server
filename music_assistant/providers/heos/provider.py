@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from functools import partial
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.config_entries import ConfigEntry
@@ -19,7 +20,10 @@ from music_assistant.helpers.util import get_primary_ip_address_from_zeroconf
 from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.heos.constants import HEOS_PASSIVE_SOURCES
 
+from .avr import AvrClient, AvrError, AvrZones
 from .constants import (
+    AVR_ZONE_POLL_INTERVAL,
+    CONF_AVR_ZONES,
     CONF_TIMEOUT,
     CONNECT_INITIAL_RETRY_DELAY,
     CONNECT_MAX_ATTEMPTS,
@@ -27,6 +31,7 @@ from .constants import (
     DEFAULT_TIMEOUT,
 )
 from .player import HeosPlayer
+from .zone_player import HeosAvrZonePlayer
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -56,6 +61,8 @@ class HeosPlayerProvider(PlayerProvider):
         super().__init__(mass, manifest, config, supported_features)
         self._music_source_list: list[PlayerSource] = []
         self._input_source_list: list[MediaItem] = []
+        self._avr_zones: dict[str, AvrZones] = {}
+        self._avr_zone_poll_task: asyncio.Task[None] | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -75,6 +82,13 @@ class HeosPlayerProvider(PlayerProvider):
                 range=(10, 60),
                 requires_reload=True,
                 advanced=True,
+            ),
+            ConfigEntry(
+                key=CONF_AVR_ZONES,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                required=False,
+                requires_reload=True,
             ),
         )
 
@@ -99,6 +113,26 @@ class HeosPlayerProvider(PlayerProvider):
 
             # Explicitly discover players now
             await self.discover_players()
+
+    def get_zone_player(self, player_id: str) -> HeosAvrZonePlayer | None:
+        """
+        Return the receiver zone player with the given id, if it is one.
+
+        :param player_id: Any player_id.
+        """
+        player = self.mass.players.get_player(player_id)
+        return player if isinstance(player, HeosAvrZonePlayer) else None
+
+    def active_zone_player_ids(self, heos_player_id: str) -> list[str]:
+        """
+        Return the zone players of a receiver that are listening to its HEOS stream.
+
+        :param heos_player_id: player_id of the receiver's HEOS player.
+        """
+        player = self.mass.players.get_player(heos_player_id)
+        if not isinstance(player, HeosPlayer):
+            return []
+        return player.active_zone_player_ids()
 
     async def _setup_controllers(self, controller_ip: str, connect_preferred: bool = False) -> None:
         """Set up the HEOS controller."""
@@ -246,6 +280,9 @@ class HeosPlayerProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        if self._avr_zone_poll_task:
+            self._avr_zone_poll_task.cancel()
+            self._avr_zone_poll_task = None
         await self._disconnect_controllers()
 
         for player in self.players:
@@ -304,6 +341,13 @@ class HeosPlayerProvider(PlayerProvider):
 
                 heos_player = HeosPlayer(self, device)
                 await heos_player.setup()
+                if self.config.get_value(CONF_AVR_ZONES):
+                    try:
+                        await self._setup_avr_zones(heos_player)
+                    except AvrError as err:
+                        self.logger.warning(
+                            "Failed to set up zones of %s: %s", heos_player.name, err
+                        )
         finally:
             self._player_discovery_running = False
 
@@ -341,3 +385,53 @@ class HeosPlayerProvider(PlayerProvider):
             self._controller_discovery_running = False
 
         await self.discover_players()
+
+    async def _setup_avr_zones(self, heos_player: HeosPlayer) -> None:
+        """Create zone players for a multi-zone receiver, if this HEOS device is one."""
+        ip_address = heos_player.device_info.ip_address
+        if not ip_address:
+            return
+        client = await AvrClient.probe(self.mass.http_session, ip_address)
+        if client is None:
+            self.logger.debug("%s has no receiver zone control interface", heos_player.name)
+            return
+        zone_names = await client.get_zone_names()
+        if len(zone_names) < 2:
+            return
+        self.logger.info(
+            "Controlling zones %s of %s at %s:%s",
+            ", ".join(zone_names.values()),
+            heos_player.name,
+            client.host,
+            client.port,
+        )
+
+        zones = AvrZones(client, zone_names)
+        await zones.refresh()
+        zone_players = {
+            zone: HeosAvrZonePlayer(self, heos_player, zones, zone) for zone in zone_names
+        }
+        heos_player.attach_zones(zones, zone_players)
+        for zone_player in zone_players.values():
+            await zone_player.setup()
+
+        zones.add_listener(partial(self._on_avr_zones_changed, heos_player))
+        self._avr_zones[heos_player.player_id] = zones
+        self._on_avr_zones_changed(heos_player)
+        if self._avr_zone_poll_task is None:
+            self._avr_zone_poll_task = self.mass.create_task(self._poll_avr_zones())
+
+    def _on_avr_zones_changed(self, heos_player: HeosPlayer) -> None:
+        heos_player.update_zone_players()
+        # zone membership shows up in whichever HEOS player leads the receiver's group
+        for player in self.mass.players.all_players(provider_filter=self.instance_id):
+            if isinstance(player, HeosPlayer):
+                player.update_group_members()
+
+    async def _poll_avr_zones(self) -> None:
+        # the receiver's HTTP interface has no push events, so changes made on the
+        # receiver itself or in another app are picked up by polling
+        while True:
+            await asyncio.sleep(AVR_ZONE_POLL_INTERVAL)
+            for zones in list(self._avr_zones.values()):
+                await zones.refresh()
