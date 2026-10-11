@@ -84,7 +84,8 @@ class HeosAvrZonePlayer(Player):
             software_version=heos_device_info.software_version,
             manufacturer=heos_device_info.manufacturer,
         )
-        device_info.ip_address = heos_device_info.ip_address
+        # no ip/mac on zone players: they would be mistaken for (and merged with) the
+        # receiver's own AirPlay/DLNA players, which share that identity
         self._attr_device_info = device_info
         zone_name = self.zones.zone_names.get(self.zone, self.zone)
         self._attr_name = f"{self.heos_player.name} {zone_name}"
