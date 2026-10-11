@@ -2,7 +2,7 @@
   "config_entries": {
     "avr_zones": {
       "label": "Control AV receiver zones",
-      "description": "Show each zone of a multi-zone Denon/Marantz AV receiver as its own player, with its own power, volume and mute, using the receiver's HTTP control interface. All zones play the receiver's HEOS stream; the receiver's HEOS player keeps the playback controls."
+      "description": "Show each zone of a multi-zone Denon/Marantz AV receiver as its own speaker, with its own power, volume and mute, using the receiver's HTTP control interface. A receiver has a single HEOS stream, so every zone that is on and set to HEOS hears what any of them plays."
     },
     "ip_address": {
       "label": "Main controller hostname or IP address.",

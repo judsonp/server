@@ -30,6 +30,7 @@ from .constants import (
     CONNECT_RETRY_BACKOFF_FACTOR,
     DEFAULT_TIMEOUT,
 )
+from .grouping import group_members_by_leader
 from .player import HeosPlayer
 from .zone_player import HeosAvrZonePlayer
 
@@ -123,16 +124,13 @@ class HeosPlayerProvider(PlayerProvider):
         player = self.mass.players.get_player(player_id)
         return player if isinstance(player, HeosAvrZonePlayer) else None
 
-    def active_zone_player_ids(self, heos_player_id: str) -> list[str]:
-        """
-        Return the zone players of a receiver that are listening to its HEOS stream.
-
-        :param heos_player_id: player_id of the receiver's HEOS player.
-        """
-        player = self.mass.players.get_player(heos_player_id)
-        if not isinstance(player, HeosPlayer):
-            return []
-        return player.active_zone_player_ids()
+    def update_group_members(self) -> None:
+        """Recompute the group members of all HEOS and receiver zone players."""
+        players = list(self.mass.players.all_players(provider_filter=self.instance_id))
+        groups = group_members_by_leader(p for p in players if isinstance(p, HeosPlayer))
+        for player in players:
+            if isinstance(player, HeosPlayer | HeosAvrZonePlayer):
+                player.set_group_members(groups.get(player.player_id, []))
 
     async def _setup_controllers(self, controller_ip: str, connect_preferred: bool = False) -> None:
         """Set up the HEOS controller."""
@@ -423,10 +421,7 @@ class HeosPlayerProvider(PlayerProvider):
 
     def _on_avr_zones_changed(self, heos_player: HeosPlayer) -> None:
         heos_player.update_zone_players()
-        # zone membership shows up in whichever HEOS player leads the receiver's group
-        for player in self.mass.players.all_players(provider_filter=self.instance_id):
-            if isinstance(player, HeosPlayer):
-                player.update_group_members()
+        self.update_group_members()
 
     async def _poll_avr_zones(self) -> None:
         # the receiver's HTTP interface has no push events, so changes made on the

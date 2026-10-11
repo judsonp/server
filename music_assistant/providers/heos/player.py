@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from copy import copy
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.config_entries import ConfigEntry
@@ -22,6 +21,7 @@ from pyheos import PlayState as HeosPlayState
 
 from music_assistant.constants import EXTERNAL_PAUSE_IDLE_TIMEOUT, VERBOSE_LOG_LEVEL
 from music_assistant.models.player import Player, PlayerMedia
+from music_assistant.providers.heos.grouping import plan_member_change
 from music_assistant.providers.heos.helpers import media_uri_from_now_playing_media
 
 from .constants import (
@@ -68,6 +68,16 @@ class HeosPlayer(Player):
         """Return if the player requires flow mode."""
         return True
 
+    @property
+    def heos_group_members(self) -> list[str]:
+        """Return the HEOS group (leader first) this player leads, or an empty list."""
+        return self._heos_group_members
+
+    @property
+    def in_heos_group(self) -> bool:
+        """Return if this player is part of a HEOS group, as leader or member."""
+        return self._device.group_id is not None
+
     def __init__(self, provider: HeosPlayerProvider, device: PyHeosPlayer) -> None:
         """Initialize the Player."""
         super().__init__(provider, str(device.player_id))
@@ -82,6 +92,8 @@ class HeosPlayer(Player):
         self._heos_group_members: list[str] = []
         self.avr_zones: AvrZones | None = None
         self.zone_players: dict[str, HeosAvrZonePlayer] = {}
+        # zone that last played or grouped; it leads when several zones are listening
+        self.lead_zone: str | None = None
 
         if self._device.heos is None:
             raise SetupFailedError("HEOS device has no controller assigned")
@@ -166,17 +178,16 @@ class HeosPlayer(Player):
         }
         self._attr_volume_level = None
         self._attr_volume_muted = None
-        self.update_group_members()
 
     def active_zone_player_ids(self) -> list[str]:
-        """Return the ids of this receiver's zone players that are listening to its stream."""
+        """Return the ids of this receiver's zone players listening to its stream, lead first."""
         if self.avr_zones is None:
             return []
-        return [
-            self.zone_players[zone].player_id
-            for zone in self.avr_zones.zones_playing_heos()
-            if zone in self.zone_players
-        ]
+        zones = sorted(
+            (zone for zone in self.avr_zones.zones_playing_heos() if zone in self.zone_players),
+            key=lambda zone: zone != self.lead_zone,
+        )
+        return [self.zone_players[zone].player_id for zone in zones]
 
     async def build_group_list(self) -> None:
         """Build group list based on group info from controller."""
@@ -190,31 +201,86 @@ class HeosPlayer(Player):
         else:
             self._heos_group_members = []
 
-        self.update_group_members()
+        cast("HeosPlayerProvider", self.provider).update_group_members()
 
-    def update_group_members(self) -> None:
-        """Combine the HEOS group with the receiver zones that are listening to it."""
-        prov = cast("HeosPlayerProvider", self.provider)
-        if self._heos_group_members:
-            heos_members = self._heos_group_members
-        elif self._device.group_id is None and self.avr_zones is not None:
-            heos_members = [self.player_id]
-        else:
-            heos_members = []
+    def set_group_members(self, members: list[str]) -> None:
+        """
+        Set the group members, as computed by the provider for all HEOS players.
 
-        zone_members = [
-            zone_player_id
-            for member_id in heos_members
-            for zone_player_id in prov.active_zone_player_ids(member_id)
-        ]
-        if zone_members:
-            self._attr_group_members = [*heos_members, *zone_members]
-        elif len(heos_members) > 1:
-            self._attr_group_members = list(heos_members)
-        else:
-            self._attr_group_members = []
+        :param members: Group members (this player first), or an empty list.
+        """
+        if members != self._attr_group_members:
+            self._attr_group_members = members
+            self.update_state()
+
+    async def play_media_for(self, owner_id: str, media: PlayerMedia) -> None:
+        """
+        Play media on this device on behalf of a player, such as one of its zones.
+
+        :param owner_id: player_id whose queue the media belongs to.
+        :param media: The media to play.
+        """
+        self.logger.debug(
+            "[%s] Received PLAY_MEDIA command for %s with media_type=%s uri=%s",
+            self._device.name,
+            owner_id,
+            media.media_type,
+            media.uri,
+        )
+
+        url = await self.provider.mass.streams.resolve_stream_url(owner_id, media)
+        self._cancel_ma_playback_transition()
+        self._ma_playback_starting = True
+        self._ma_controls_playback = True
+        try:
+            await self._device.play_url(url)
+        except HeosError as err:
+            self._cancel_ma_playback_transition()
+            self._ma_controls_playback = False
+            self._queue_cleanup_pending = False
+            raise PlayerCommandFailed("Failed to start playback.") from err
+
+        self._attr_current_media = media
+        self._attr_active_source = owner_id
+        self._queue_cleanup_pending = True
+
+        self.mass.call_later(
+            self.get_config_value(
+                CONF_PLAYBACK_TRANSITION_TIMEOUT,
+                DEFAULT_PLAYBACK_TRANSITION_TIMEOUT,
+                return_type=int,
+            ),
+            self._finish_ma_playback_transition,
+            task_id=self._ma_playback_transition_timer_id,
+        )
 
         self.update_state()
+        self.update_zone_players()
+
+    async def change_members(
+        self, player_ids_to_add: list[str], player_ids_to_remove: list[str]
+    ) -> None:
+        """
+        Change the group this device leads; members may be HEOS players or receiver zones.
+
+        :param player_ids_to_add: Player ids to add to the group.
+        :param player_ids_to_remove: Player ids to remove from the group.
+        """
+        prov = cast("HeosPlayerProvider", self.provider)
+        change = plan_member_change(
+            self, player_ids_to_add, player_ids_to_remove, prov.get_zone_player
+        )
+        if change.heos_members is not None:
+            if len(change.heos_members) <= 1:
+                await self._heos.remove_group(self._device.player_id)
+            else:
+                await self._heos.set_group([int(player) for player in change.heos_members])
+            # group_members will be updated when group_changed event is handled
+
+        for zone_player in change.zones_off:
+            await zone_player.power(False)
+        for zone_player in change.zones_on:
+            await zone_player.power(True)
 
     def update_zone_players(self) -> None:
         """Push this receiver's playback state to its zone players."""
@@ -432,40 +498,7 @@ class HeosPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA command on given player."""
-        self.logger.debug(
-            "[%s] Received PLAY_MEDIA command with media_type=%s uri=%s",
-            self._device.name,
-            media.media_type,
-            media.uri,
-        )
-
-        url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
-        self._cancel_ma_playback_transition()
-        self._ma_playback_starting = True
-        self._ma_controls_playback = True
-        try:
-            await self._device.play_url(url)
-        except HeosError as err:
-            self._cancel_ma_playback_transition()
-            self._ma_controls_playback = False
-            self._queue_cleanup_pending = False
-            raise PlayerCommandFailed("Failed to start playback.") from err
-
-        self._attr_current_media = media
-        self._attr_active_source = self.player_id
-        self._queue_cleanup_pending = True
-
-        self.mass.call_later(
-            self.get_config_value(
-                CONF_PLAYBACK_TRANSITION_TIMEOUT,
-                DEFAULT_PLAYBACK_TRANSITION_TIMEOUT,
-                return_type=int,
-            ),
-            self._finish_ma_playback_transition,
-            task_id=self._ma_playback_transition_timer_id,
-        )
-
-        self.update_state()
+        await self.play_media_for(self.player_id, media)
 
     def _schedule_queue_cleanup(self) -> None:
         """Debounce queue cleanup so rapid queue changes only trigger one follow-up."""
@@ -553,50 +586,7 @@ class HeosPlayer(Player):
         """Handle SET MEMBERS command on player."""
         if player_ids_to_add is None and player_ids_to_remove is None:
             return
-
-        prov = cast("HeosPlayerProvider", self.provider)
-        zones_to_add = [prov.get_zone_player(pid) for pid in player_ids_to_add or []]
-        zones_to_remove = [prov.get_zone_player(pid) for pid in player_ids_to_remove or []]
-        heos_ids_to_add = [
-            pid for pid, zone in zip(player_ids_to_add or [], zones_to_add, strict=True) if not zone
-        ]
-        heos_ids_to_remove = [
-            pid
-            for pid, zone in zip(player_ids_to_remove or [], zones_to_remove, strict=True)
-            if not zone
-        ]
-        # a zone can only hear its own receiver's stream, so that receiver joins the group too
-        for zone_player in zones_to_add:
-            if zone_player and zone_player.heos_player.player_id not in heos_ids_to_add:
-                heos_ids_to_add.append(zone_player.heos_player.player_id)
-
-        members: list[str] = copy(self._heos_group_members)
-
-        #  Make sure we are always in the group
-        if self.player_id not in members:
-            members = [self.player_id, *members]
-
-        for added_player_id in heos_ids_to_add:
-            if added_player_id not in members:
-                members.append(added_player_id)
-
-        for removed_player_id in heos_ids_to_remove:
-            if removed_player_id in members:
-                members.remove(removed_player_id)
-
-        if members != (self._heos_group_members or [self.player_id]):
-            if len(members) <= 1:
-                await self._heos.remove_group(self._device.player_id)
-            else:
-                await self._heos.set_group([int(player) for player in members])
-            # group_members will be updated when group_changed event is handled
-
-        for zone_player in zones_to_remove:
-            if zone_player:
-                await zone_player.power(False)
-        for zone_player in zones_to_add:
-            if zone_player:
-                await zone_player.power(True)
+        await self.change_members(player_ids_to_add or [], player_ids_to_remove or [])
 
     async def select_source(self, source: str) -> None:
         """Handle SELECT SOURCE command on the player."""
