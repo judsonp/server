@@ -420,6 +420,7 @@ class HeosPlayerProvider(PlayerProvider):
             self._avr_zone_poll_task = self.mass.create_task(self._poll_avr_zones())
 
     def _on_avr_zones_changed(self, heos_player: HeosPlayer) -> None:
+        heos_player.sync_session_zones()
         heos_player.update_zone_players()
         self.update_group_members()
 

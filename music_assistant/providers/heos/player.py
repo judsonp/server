@@ -92,8 +92,9 @@ class HeosPlayer(Player):
         self._heos_group_members: list[str] = []
         self.avr_zones: AvrZones | None = None
         self.zone_players: dict[str, HeosAvrZonePlayer] = {}
-        # zone that last played or grouped; it leads when several zones are listening
-        self.lead_zone: str | None = None
+        # the zones meant to hear this receiver's stream, leading zone first
+        self.session_zones: list[str] = []
+        self._applying_session = False
 
         if self._device.heos is None:
             raise SetupFailedError("HEOS device has no controller assigned")
@@ -178,16 +179,56 @@ class HeosPlayer(Player):
         }
         self._attr_volume_level = None
         self._attr_volume_muted = None
+        self.sync_session_zones()
 
     def active_zone_player_ids(self) -> list[str]:
-        """Return the ids of this receiver's zone players listening to its stream, lead first."""
+        """Return the ids of the zone players in this receiver's session, leading zone first."""
         if self.avr_zones is None:
             return []
-        zones = sorted(
-            (zone for zone in self.avr_zones.zones_playing_heos() if zone in self.zone_players),
-            key=lambda zone: zone != self.lead_zone,
-        )
-        return [self.zone_players[zone].player_id for zone in zones]
+        listening = set(self.avr_zones.zones_playing_heos())
+        return [
+            self.zone_players[zone].player_id
+            for zone in self.session_zones
+            if zone in listening and zone in self.zone_players
+        ]
+
+    def sync_session_zones(self) -> None:
+        """Follow zone changes made outside Music Assistant, e.g. with the remote."""
+        if self.avr_zones is None or self._applying_session:
+            return
+        listening = [z for z in self.avr_zones.zones_playing_heos() if z in self.zone_players]
+        # a zone switched to HEOS elsewhere hears the stream, so it joins the session
+        self.session_zones = [z for z in self.session_zones if z in listening] + [
+            z for z in listening if z not in self.session_zones
+        ]
+
+    async def set_session_zones(self, zones: list[str]) -> None:
+        """
+        Make exactly these zones hear this receiver's stream; the others stop listening.
+
+        Zones on other inputs are left alone; zones on the HEOS input that are not in the
+        session are turned off.
+
+        :param zones: Zone keys, leading zone first.
+        """
+        if self.avr_zones is None:
+            return
+        self.session_zones = list(zones)
+        self._applying_session = True
+        try:
+            for zone in self.avr_zones.zones_playing_heos():
+                if zone not in zones and zone in self.zone_players:
+                    await self.zone_players[zone].set_zone_power(False)
+            for zone in zones:
+                if not self.avr_zones.states[zone].plays_heos:
+                    await self.zone_players[zone].set_zone_power(True)
+        finally:
+            self._applying_session = False
+        self.update_zone_players()
+        cast("HeosPlayerProvider", self.provider).update_group_members()
+        if not zones and not self.in_heos_group and self.playback_state == PlaybackState.PLAYING:
+            # nothing hears the stream any more (stopping a grouped receiver stops its group)
+            await self.stop()
 
     async def build_group_list(self) -> None:
         """Build group list based on group info from controller."""
