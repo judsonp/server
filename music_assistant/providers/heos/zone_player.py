@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Coroutine
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player import DeviceInfo
 
-from music_assistant.models.player import Player
+from music_assistant.models.player import Player, PlayerMedia
 
 from .avr import AvrError
 from .constants import AVR_ZONE_SPLITTER
@@ -24,6 +24,10 @@ ZONE_PLAYER_FEATURES = {
     PlayerFeature.POWER,
     PlayerFeature.VOLUME_SET,
     PlayerFeature.VOLUME_MUTE,
+    PlayerFeature.PAUSE,
+    PlayerFeature.NEXT_PREVIOUS,
+    PlayerFeature.SET_MEMBERS,
+    PlayerFeature.PLAY_MEDIA,
 }
 
 
@@ -42,10 +46,15 @@ class HeosAvrZonePlayer(Player):
     One zone of a HEOS-enabled AV receiver.
 
     A receiver has a single HEOS stream, played by its HEOS player, that every zone set to
-    the HEOS input hears. A zone player therefore plays nothing of its own: it controls the
-    zone's power, volume and mute, and takes part in the HEOS player's group while it is
-    listening to that stream.
+    the HEOS input hears. A zone player has its own power, volume and mute; playback and
+    grouping go through the receiver's HEOS player, and every zone that is listening hears
+    what any of them plays.
     """
+
+    @property
+    def requires_flow_mode(self) -> bool:
+        """Return if the player requires flow mode."""
+        return True
 
     def __init__(
         self,
@@ -90,6 +99,7 @@ class HeosAvrZonePlayer(Player):
         zone_name = self.zones.zone_names.get(self.zone, self.zone)
         self._attr_name = f"{self.heos_player.name} {zone_name}"
         self._attr_available = self.zones.available and self.heos_player.available
+        self._attr_supported_sample_rates = self.heos_player.supported_sample_rates
 
         state = self.zones.states[self.zone]
         self._attr_powered = state.powered
@@ -98,13 +108,25 @@ class HeosAvrZonePlayer(Player):
         if state.plays_heos:
             self._attr_playback_state = self.heos_player.playback_state
             self._attr_current_media = self.heos_player.current_media
+            self._attr_active_source = self.heos_player.active_source
             self._attr_elapsed_time = self.heos_player.elapsed_time
             self._attr_elapsed_time_last_updated = self.heos_player.elapsed_time_last_updated
         else:
             self._attr_playback_state = PlaybackState.IDLE
             self._attr_current_media = None
+            self._attr_active_source = None
             self._attr_elapsed_time = None
             self._attr_elapsed_time_last_updated = None
+
+    def set_group_members(self, members: list[str]) -> None:
+        """
+        Set the group members, as computed by the provider for all HEOS players.
+
+        :param members: Group members (this player first), or an empty list.
+        """
+        if members != self._attr_group_members:
+            self._attr_group_members = members
+            self.update_state()
 
     async def power(self, powered: bool) -> None:
         """
@@ -129,6 +151,59 @@ class HeosAvrZonePlayer(Player):
         :param muted: bool if the zone should be muted.
         """
         await self._run_zone_command(self.zones.set_mute(self.zone, muted))
+
+    async def play_media(self, media: PlayerMedia) -> None:
+        """
+        Handle PLAY MEDIA command on the player.
+
+        :param media: The media to play on the receiver's stream, which this zone hears.
+        """
+        self._take_lead()
+        if not self.zones.states[self.zone].plays_heos:
+            await self.power(True)
+        await self.heos_player.play_media_for(self.player_id, media)
+
+    async def play(self) -> None:
+        """Handle PLAY command on the player."""
+        await self.heos_player.play()
+
+    async def pause(self) -> None:
+        """Handle PAUSE command on the player."""
+        await self.heos_player.pause()
+
+    async def stop(self) -> None:
+        """Handle STOP command on the player."""
+        await self.heos_player.stop()
+
+    async def next_track(self) -> None:
+        """Handle NEXT_TRACK command on the player."""
+        await self.heos_player.next_track()
+
+    async def previous_track(self) -> None:
+        """Handle PREVIOUS_TRACK command on the player."""
+        await self.heos_player.previous_track()
+
+    async def set_members(
+        self,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """
+        Handle SET MEMBERS command on the player.
+
+        :param player_ids_to_add: Player ids (HEOS players or zones) to add to the group.
+        :param player_ids_to_remove: Player ids (HEOS players or zones) to remove.
+        """
+        if player_ids_to_add is None and player_ids_to_remove is None:
+            return
+        self._take_lead()
+        await self.heos_player.change_members(player_ids_to_add or [], player_ids_to_remove or [])
+
+    def _take_lead(self) -> None:
+        if self.heos_player.lead_zone == self.zone:
+            return
+        self.heos_player.lead_zone = self.zone
+        cast("HeosPlayerProvider", self.provider).update_group_members()
 
     async def _run_zone_command(self, command: Coroutine[Any, Any, None]) -> None:
         try:

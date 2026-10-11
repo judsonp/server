@@ -1450,7 +1450,7 @@
   "provider.hass_players.config_entries.players.label": "Player entities",
   "provider.hass_players.config_entries.warn_hass_integration.label": "Music Assistant has native support for this player type - it is strongly recommended to use the native player provider for this player in Music Assistant instead of the generic version provided by the Home Assistant provider.",
   "provider.hass_players.manifest.description": "Control and play music on (supported) Home Assistant media players in your smart home.",
-  "provider.heos.config_entries.avr_zones.description": "Show each zone of a multi-zone Denon/Marantz AV receiver as its own player, with its own power, volume and mute, using the receiver's HTTP control interface. All zones play the receiver's HEOS stream; the receiver's HEOS player keeps the playback controls.",
+  "provider.heos.config_entries.avr_zones.description": "Show each zone of a multi-zone Denon/Marantz AV receiver as its own speaker, with its own power, volume and mute, using the receiver's HTTP control interface. A receiver has a single HEOS stream, so every zone that is on and set to HEOS hears what any of them plays.",
   "provider.heos.config_entries.avr_zones.label": "Control AV receiver zones",
   "provider.heos.config_entries.ip_address.description": "Hostname or IP address of the HEOS device to be used as the main controller. It is recommended to use a wired device as the main controller.",
   "provider.heos.config_entries.ip_address.label": "Main controller hostname or IP address.",
