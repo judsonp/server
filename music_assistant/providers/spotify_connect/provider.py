@@ -113,6 +113,13 @@ PLAYBACK_START_TIMEOUT_S = 3.0
 # _deferred_play_media_fire for why).
 PLAY_MEDIA_DEBOUNCE_S = 0.5
 
+# Spotify can drop the device's session for a moment and pick it up again by itself
+# (seen between tracks). Hold the consuming player's stream for this long after
+# 'inactive' so a blip does not stop the player and restart its stream, which costs
+# seconds of silence on players that are slow to start (HEOS); a session that stays
+# gone stops the player when it runs out.
+SESSION_INACTIVE_GRACE_S = 5.0
+
 # Ignore Spotify volume events for this long after a session becomes active, so
 # the player's own volume wins over the backend's initial value on (re)connect.
 INITIAL_VOLUME_GRACE_S = 3.0
@@ -167,6 +174,10 @@ class _PlayerDaemon:
     # it while it is still in flight (a slow player can hold it for up to
     # 10s), so a resume is never killed by a stop landing late.
     pending_pause_stop_task: asyncio.Task[None] | None = None
+    # holds the deferred end of a session that went 'inactive' while a player was
+    # consuming it; an 'active' within SESSION_INACTIVE_GRACE_S cancels it, so the
+    # player keeps its claim and stream through the blip.
+    pending_session_end_task: asyncio.Task[None] | None = None
     last_session_active_time: float = 0
     last_volume_sent: int | None = None
     # Last context/track URIs seen on the event stream. Used to take playback
@@ -435,6 +446,16 @@ class SpotifyConnectProvider(PluginProvider):
         if daemon is None or not player_id:
             return
 
+        # Another player takes over a session that went inactive: stop waiting for it to
+        # come back. Its 'playing' state is stale, so playback is acquired afresh below.
+        # (The same player reconnecting its stream keeps waiting.)
+        if (
+            daemon.pending_session_end_task is not None
+            and daemon.active_player_id != owner_player_id
+        ):
+            self._cancel_pending_session_end(daemon)
+            daemon.playing = False
+
         # Cache the owner_player_id (== user-facing MA player) rather than the
         # protocol-level player_id. Some protocol players are ephemeral bridges
         # whose ID is invalid for play_media / queue lookups once torn down.
@@ -524,7 +545,10 @@ class SpotifyConnectProvider(PluginProvider):
         daemon.active_session_id = None
         if daemon.in_use_by_player == owner_player_id:
             daemon.in_use_by_player = None
-        if daemon.playing:
+        # During the inactive grace the session is gone already and may come back by
+        # itself; releasing it here would turn that blip into a real stop. (The claim is
+        # released above, so a returning 'playing' starts a fresh stream.)
+        if daemon.playing and daemon.pending_session_end_task is None:
             # MA-side stop/queue-clear: release the Spotify session so the app
             # drops the device as its playback target — the daemon would
             # otherwise keep playing into a pipe nobody consumes and the app
@@ -540,6 +564,13 @@ class SpotifyConnectProvider(PluginProvider):
         """Release the Spotify session when a player is done with this source."""
         daemon = self._daemons.get(source_id)
         if daemon is None or daemon.active_player_id != player_id:
+            return
+        if daemon.pending_session_end_task is not None:
+            # The player moved on while the session was gone: end it now, without the
+            # stop that would cut whatever the player plays instead.
+            self._cancel_pending_session_end(daemon)
+            daemon.active_player_id = None
+            self._end_session(daemon)
             return
         if not daemon.spotify_session_active:
             return
@@ -700,11 +731,16 @@ class SpotifyConnectProvider(PluginProvider):
         daemon.stop_called = True
         pending_tasks = [
             task
-            for task in (daemon.pending_play_media_task, daemon.pending_pause_stop_task)
+            for task in (
+                daemon.pending_play_media_task,
+                daemon.pending_pause_stop_task,
+                daemon.pending_session_end_task,
+            )
             if task is not None and not task.done()
         ]
         self._cancel_pending_play_media(daemon)
         self._cancel_pending_pause_stop(daemon)
+        self._cancel_pending_session_end(daemon)
         # await the cancelled tasks so no late player command outlives the daemon
         for task in pending_tasks:
             with suppress(asyncio.CancelledError):
@@ -938,6 +974,65 @@ class SpotifyConnectProvider(PluginProvider):
         if daemon.pending_pause_stop_task is task:
             daemon.pending_pause_stop_task = None
 
+    def _schedule_session_end(self, daemon: _PlayerDaemon) -> None:
+        """
+        End the inactive session after a grace period, unless it comes back first.
+
+        A pending end keeps its deadline: a repeated 'inactive' does not extend it.
+
+        :param daemon: The daemon whose session went inactive.
+        """
+        if (
+            daemon.pending_session_end_task is not None
+            and not daemon.pending_session_end_task.done()
+        ):
+            return
+        daemon.pending_session_end_task = self.mass.create_task(
+            self._end_session_after_grace(daemon)
+        )
+
+    def _cancel_pending_session_end(self, daemon: _PlayerDaemon) -> None:
+        """Cancel any pending deferred end of an inactive session."""
+        task = daemon.pending_session_end_task
+        if task is not None and not task.done():
+            task.cancel()
+        daemon.pending_session_end_task = None
+
+    async def _end_session_after_grace(self, daemon: _PlayerDaemon) -> None:
+        """End the inactive session once the grace period passed without an 'active'."""
+        try:
+            await asyncio.sleep(SESSION_INACTIVE_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        daemon.pending_session_end_task = None
+        self.logger.debug(
+            "Spotify Connect session for %s did not come back, ending it", daemon.publish_name
+        )
+        self._end_session(daemon)
+
+    def _keep_returned_session(self, daemon: _PlayerDaemon) -> None:
+        """Keep the consuming player on a session that came back within its inactive grace."""
+        self._cancel_pending_session_end(daemon)
+        self.logger.info(
+            "Spotify Connect session for %s came back, keeping playback on %s",
+            daemon.publish_name,
+            daemon.active_player_id,
+        )
+        # it paused meanwhile: the stop the grace held back is due now
+        if (
+            not daemon.playing
+            and not daemon.backend.stream_ends_on_pause
+            and daemon.active_player_id
+        ):
+            self._schedule_pause_stop(daemon, daemon.active_player_id)
+
+    def _end_session(self, daemon: _PlayerDaemon) -> None:
+        """Release the consuming player of a session that ended, and stop it."""
+        prev_player_id = daemon.active_player_id
+        self._clear_active_player(daemon)
+        if prev_player_id:
+            self._schedule_pause_stop(daemon, prev_player_id)
+
     async def _deferred_play_media_fire(self, daemon: _PlayerDaemon) -> None:
         """
         Trigger play_media after a short debounce.
@@ -1032,6 +1127,8 @@ class SpotifyConnectProvider(PluginProvider):
             # session. Reconcile afterwards because 'playing' may arrive first.
             self._cancel_pending_play_media(daemon)
             self.logger.info("Spotify Connect session active for %s", daemon.publish_name)
+            if daemon.pending_session_end_task is not None:
+                self._keep_returned_session(daemon)
             # A new session starts at the backend's 100% volume default; push the
             # target player's volume so the Spotify app's slider is correct from
             # device selection, before any playback starts. (In the soloist
@@ -1046,10 +1143,11 @@ class SpotifyConnectProvider(PluginProvider):
             daemon.spotify_session_active = False
             # stale options must not outlive the session they belong to
             daemon.last_playback_options = None
-            prev_player_id = daemon.active_player_id
-            self._clear_active_player(daemon)
-            if prev_player_id:
-                self._schedule_pause_stop(daemon, prev_player_id)
+            if daemon.active_player_id:
+                # possibly a blip: the player keeps its claim and stream for now
+                self._schedule_session_end(daemon)
+            else:
+                self._end_session(daemon)
             return
         elif event.type is BackendEventType.PLAYING:
             daemon.playing = True
@@ -1077,10 +1175,12 @@ class SpotifyConnectProvider(PluginProvider):
             # the player must be stopped actively; the claim stays so the next
             # 'playing' event resumes playback like the EOF path does. Only the
             # playing→paused transition fires it: the backend reports a pause
-            # through multiple events (state delta + snapshot).
+            # through multiple events (state delta + snapshot). A session waiting out
+            # its inactive grace is left to its end or return to decide.
             if (
                 was_playing
                 and not daemon.backend.stream_ends_on_pause
+                and daemon.pending_session_end_task is None
                 and (player_id := daemon.active_player_id)
             ):
                 self._schedule_pause_stop(daemon, player_id)

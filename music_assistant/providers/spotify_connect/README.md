@@ -57,7 +57,10 @@ as `BackendEvent`s through a single async callback and answers `get_stream_sourc
   the Spotify session (`deactivate`), so the Spotify app drops the device as its
   playback target instead of staying tethered to it.
 - **Session inactive → bounded stop**: when the user deselects the device in the Spotify
-  app, the active MA player is stopped (bounded, so a slow player cannot wedge it).
+  app, the active MA player is stopped (bounded, so a slow player cannot wedge it). The
+  stop waits a short grace period first: Spotify can drop the session for a moment and
+  pick it up again on its own, and an `active` within that window keeps the player on
+  its stream instead of stopping and restarting it.
 - **Live metadata**: title/artist/album/artwork/position are pushed into the active queue
   item's `StreamDetails.stream_metadata` — the same channel ICY radio metadata uses.
 - **Volume dedupe/grace**: Spotify-side volume events are de-duplicated and ignored briefly

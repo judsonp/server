@@ -318,9 +318,18 @@ async def _session_inactive(provider: SpotifyConnectProvider, daemon: _PlayerDae
         stopped.append(player_id)
 
     provider._schedule_pause_stop = _record_stop  # type: ignore[method-assign]
-    await provider._handle_backend_event(
-        daemon, BackendEvent(type=BackendEventType.SESSION_INACTIVE)
+    mass = cast("Any", provider.mass)
+    # run the deferred session end for real; anything else stays a mock
+    mass.create_task.side_effect = lambda coro: (
+        asyncio.ensure_future(coro) if asyncio.iscoroutine(coro) else MagicMock()
     )
+    with patch("music_assistant.providers.spotify_connect.provider.SESSION_INACTIVE_GRACE_S", 0):
+        await provider._handle_backend_event(
+            daemon, BackendEvent(type=BackendEventType.SESSION_INACTIVE)
+        )
+        # a stop is deferred by the inactive grace; let it run out
+        if daemon.pending_session_end_task is not None:
+            await daemon.pending_session_end_task
     return stopped
 
 

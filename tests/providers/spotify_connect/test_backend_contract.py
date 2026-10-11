@@ -469,8 +469,9 @@ async def test_volume_event_uses_group_volume_for_player_without_own_volume() ->
     mass.players.cmd_volume_set.assert_not_awaited()
 
 
-async def test_session_inactive_stops_active_player() -> None:
-    """A SESSION_INACTIVE event clears all claims and stops the active MA player."""
+async def test_session_inactive_stops_active_player(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session that stays inactive past the grace clears all claims and stops the player."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 0.01)
     backend = FakeBackend()
     provider, daemon, mass = _make_provider(
         backend,
@@ -482,9 +483,14 @@ async def test_session_inactive_stops_active_player() -> None:
     )
 
     await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
-    # the stop runs as a bounded background task; let it start
-    await asyncio.sleep(0)
+    # within the grace the player keeps its claim
+    claim_in_grace = daemon.in_use_by_player
+    assert claim_in_grace == "queue1"
+    mass.players.cmd_stop.assert_not_called()
+    # the stop runs as a bounded background task after the grace; let it start
+    await asyncio.sleep(0.05)
 
+    assert daemon.pending_session_end_task is None
     assert daemon.spotify_session_active is False
     assert daemon.playing is False
     assert daemon.active_player_id is None
@@ -493,6 +499,161 @@ async def test_session_inactive_stops_active_player() -> None:
     mass.players.cmd_stop.assert_called_once_with("player1")
     # signing out is not a provider failure: it must never schedule an unload
     mass.call_later.assert_not_called()
+
+
+def _pipe_fed_provider(
+    *,
+    playing: bool = True,
+) -> tuple[SpotifyConnectProvider, _PlayerDaemon, MagicMock, FakeBackend]:
+    """Build a provider whose (pipe-fed) source is streaming to queue1 on player1."""
+
+    class _PipeFedBackend(FakeBackend):
+        @property
+        def stream_ends_on_pause(self) -> bool:
+            return False
+
+    backend = _PipeFedBackend()
+    provider, daemon, mass = _make_provider(
+        backend,
+        playing=playing,
+        session_active=True,
+        active_player_id="player1",
+        in_use_by_queue="queue1",
+        active_session_id="sess1",
+    )
+    mass.players.cmd_stop = AsyncMock()
+    return provider, daemon, mass, backend
+
+
+async def test_session_blip_keeps_the_player_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An 'inactive' followed by 'active' within the grace neither stops nor restarts the player."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 5.0)
+    monkeypatch.setattr(provider_mod, "PLAY_MEDIA_DEBOUNCE_S", 0.01)
+    provider, daemon, mass, _backend = _pipe_fed_provider()
+    _player_with_volume(mass, 30)
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    # a repeated 'inactive' keeps the original deadline
+    pending = daemon.pending_session_end_task
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    assert daemon.pending_session_end_task is pending
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_ACTIVE))
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.PLAYING))
+    await asyncio.sleep(0.05)
+
+    assert pending is not None
+    assert pending.cancelled()
+    assert daemon.pending_session_end_task is None
+    assert daemon.spotify_session_active is True
+    assert daemon.active_player_id == "player1"
+    assert daemon.in_use_by_player == "queue1"
+    assert daemon.active_session_id == "sess1"
+    mass.players.cmd_stop.assert_not_called()
+    mass.players.deselect_source.assert_not_called()
+    # the held stream carries on: no new play_media
+    mass.player_queues.play_media.assert_not_awaited()
+
+
+async def test_pause_during_the_grace_stops_once_the_session_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause within the grace defers its stop until the session is back."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 5.0)
+    provider, daemon, mass, _backend = _pipe_fed_provider()
+    _player_with_volume(mass, 30)
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.PAUSED))
+    await asyncio.sleep(0)
+    mass.players.cmd_stop.assert_not_called()
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_ACTIVE))
+    await asyncio.sleep(0)
+
+    mass.players.cmd_stop.assert_awaited_once_with("player1")
+    # the claim survives so the next 'playing' event can resume playback
+    assert daemon.active_player_id == "player1"
+
+
+async def test_stream_teardown_during_the_grace_keeps_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A player dropping its stream within the grace releases the claim, not the session."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 5.0)
+    monkeypatch.setattr(provider_mod, "PLAY_MEDIA_DEBOUNCE_S", 0.01)
+    provider, daemon, mass, backend = _pipe_fed_provider()
+    _player_with_volume(mass, 30)
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    await provider.on_source_unselected(_PLAYER_ID, "queue1", "sess1")
+
+    assert backend.calls == []
+    assert daemon.in_use_by_player is None
+
+    # the session comes back while still playing: a fresh stream is started
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_ACTIVE))
+    await asyncio.sleep(0.05)
+
+    mass.player_queues.play_media.assert_awaited_once_with("player1", _SOURCE_URI)
+
+
+async def test_release_during_the_grace_does_not_stop_the_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A player that moved on within the grace is let go without the deferred stop."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 0.01)
+    provider, daemon, mass, backend = _pipe_fed_provider()
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    await provider.on_source_released(_PLAYER_ID, "player1")
+    await asyncio.sleep(0.05)
+
+    assert daemon.pending_session_end_task is None
+    assert daemon.active_player_id is None
+    assert daemon.in_use_by_player is None
+    assert daemon.playing is False
+    assert backend.calls == []
+    mass.players.cmd_stop.assert_not_called()
+
+
+async def test_another_player_taking_over_during_the_grace_acquires_afresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the source on another player ends the wait and takes playback back."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 5.0)
+    provider, daemon, mass, backend = _pipe_fed_provider()
+    _player_with_volume(mass, 30)
+    daemon.last_context_uri = "spotify:playlist:ctx"
+
+    def _mark_playing() -> None:
+        daemon.playing = True
+
+    backend.on_acquire = _mark_playing
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    pending = daemon.pending_session_end_task
+    await provider.on_source_selected(_PLAYER_ID, "proto2", "queue2", "sess2")
+
+    assert pending is not None
+    assert daemon.pending_session_end_task is None
+    assert ("play", ("spotify:playlist:ctx", None)) in backend.calls
+    mass.players.cmd_stop.assert_awaited_once_with("player1")
+    assert daemon.in_use_by_player == "queue2"
+
+
+async def test_stop_daemon_cancels_a_pending_session_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping the daemon cancels the deferred session end so no late stop is sent."""
+    monkeypatch.setattr(provider_mod, "SESSION_INACTIVE_GRACE_S", 0.01)
+    provider, daemon, mass, _backend = _pipe_fed_provider()
+
+    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_INACTIVE))
+    await provider._stop_daemon(daemon)
+    await asyncio.sleep(0.05)
+
+    assert daemon.pending_session_end_task is None
+    mass.players.cmd_stop.assert_not_called()
 
 
 async def test_stream_teardown_while_playing_releases_spotify() -> None:
