@@ -36,7 +36,9 @@ from .constants import (
 if TYPE_CHECKING:
     from pyheos import HeosPlayer as PyHeosPlayer
 
+    from .avr import AvrZones
     from .provider import HeosPlayerProvider
+    from .zone_player import HeosAvrZonePlayer
 
 
 PLAYER_FEATURES = {
@@ -77,6 +79,9 @@ class HeosPlayer(Player):
         self._on_unload_callbacks.append(self._cancel_ma_playback_transition)
         self._queue_cleanup_lock = asyncio.Lock()
         self._queue_cleanup_pending = False
+        self._heos_group_members: list[str] = []
+        self.avr_zones: AvrZones | None = None
+        self.zone_players: dict[str, HeosAvrZonePlayer] = {}
 
         if self._device.heos is None:
             raise SetupFailedError("HEOS device has no controller assigned")
@@ -145,19 +150,77 @@ class HeosPlayer(Player):
                 (sr, bd) for sr in (44100, 48000, 88200, 96000, 176400, 192000) for bd in (16, 24)
             ]
 
+    def attach_zones(self, zones: AvrZones, zone_players: dict[str, HeosAvrZonePlayer]) -> None:
+        """
+        Hand volume control over to the zone players of this receiver.
+
+        :param zones: Zone tracker of the receiver.
+        :param zone_players: Zone player per zone key.
+        """
+        self.avr_zones = zones
+        self.zone_players = zone_players
+        # every zone has its own volume now, so the HEOS player (the shared stream) has none
+        self._attr_supported_features = PLAYER_FEATURES - {
+            PlayerFeature.VOLUME_SET,
+            PlayerFeature.VOLUME_MUTE,
+        }
+        self._attr_volume_level = None
+        self._attr_volume_muted = None
+        self.update_group_members()
+
+    def active_zone_player_ids(self) -> list[str]:
+        """Return the ids of this receiver's zone players that are listening to its stream."""
+        if self.avr_zones is None:
+            return []
+        return [
+            self.zone_players[zone].player_id
+            for zone in self.avr_zones.zones_playing_heos()
+            if zone in self.zone_players
+        ]
+
     async def build_group_list(self) -> None:
         """Build group list based on group info from controller."""
         # Group IDs are the player ID of the leader
         if self._device.group_id is not None and str(self._device.group_id) == self.player_id:
             group_info = await self._heos.get_group_info(self._device.group_id)
-            self._attr_group_members = [
+            self._heos_group_members = [
                 str(group_info.lead_player_id),
                 *(str(member) for member in group_info.member_player_ids),
             ]
         else:
-            self._attr_group_members.clear()
+            self._heos_group_members = []
+
+        self.update_group_members()
+
+    def update_group_members(self) -> None:
+        """Combine the HEOS group with the receiver zones that are listening to it."""
+        prov = cast("HeosPlayerProvider", self.provider)
+        if self._heos_group_members:
+            heos_members = self._heos_group_members
+        elif self._device.group_id is None and self.avr_zones is not None:
+            heos_members = [self.player_id]
+        else:
+            heos_members = []
+
+        zone_members = [
+            zone_player_id
+            for member_id in heos_members
+            for zone_player_id in prov.active_zone_player_ids(member_id)
+        ]
+        if zone_members:
+            self._attr_group_members = [*heos_members, *zone_members]
+        elif len(heos_members) > 1:
+            self._attr_group_members = list(heos_members)
+        else:
+            self._attr_group_members = []
 
         self.update_state()
+
+    def update_zone_players(self) -> None:
+        """Push this receiver's playback state to its zone players."""
+        for zone_player in self.zone_players.values():
+            zone_player.update_attributes()
+            zone_player.update_state()
 
     async def build_source_list(self) -> None:
         """Build source list based on music source list, combined with player specific inputs."""
@@ -224,9 +287,12 @@ class HeosPlayer(Player):
                 self.set_dynamic_attributes()
 
         self.update_state()
+        self.update_zone_players()
 
     def _update_player_volume(self) -> None:
         """Update volume properties."""
+        if self.avr_zones is not None:
+            return
         self._attr_volume_level = self._device.volume
         self._attr_volume_muted = self._device.is_muted
 
@@ -488,23 +554,49 @@ class HeosPlayer(Player):
         if player_ids_to_add is None and player_ids_to_remove is None:
             return
 
-        members: list[str] = copy(self._attr_group_members)
+        prov = cast("HeosPlayerProvider", self.provider)
+        zones_to_add = [prov.get_zone_player(pid) for pid in player_ids_to_add or []]
+        zones_to_remove = [prov.get_zone_player(pid) for pid in player_ids_to_remove or []]
+        heos_ids_to_add = [
+            pid for pid, zone in zip(player_ids_to_add or [], zones_to_add, strict=True) if not zone
+        ]
+        heos_ids_to_remove = [
+            pid
+            for pid, zone in zip(player_ids_to_remove or [], zones_to_remove, strict=True)
+            if not zone
+        ]
+        # a zone can only hear its own receiver's stream, so that receiver joins the group too
+        for zone_player in zones_to_add:
+            if zone_player and zone_player.heos_player.player_id not in heos_ids_to_add:
+                heos_ids_to_add.append(zone_player.heos_player.player_id)
+
+        members: list[str] = copy(self._heos_group_members)
 
         #  Make sure we are always in the group
         if self.player_id not in members:
             members = [self.player_id, *members]
 
-        for added_player_id in player_ids_to_add or []:
-            members.append(added_player_id)
+        for added_player_id in heos_ids_to_add:
+            if added_player_id not in members:
+                members.append(added_player_id)
 
-        for removed_player_id in player_ids_to_remove or []:
-            members.remove(removed_player_id)
+        for removed_player_id in heos_ids_to_remove:
+            if removed_player_id in members:
+                members.remove(removed_player_id)
 
-        if len(members) <= 1:
-            await self._heos.remove_group(self._device.player_id)
-        else:
-            await self._heos.set_group([int(player) for player in members])
-        # group_members will be updated when group_changed event is handled
+        if members != (self._heos_group_members or [self.player_id]):
+            if len(members) <= 1:
+                await self._heos.remove_group(self._device.player_id)
+            else:
+                await self._heos.set_group([int(player) for player in members])
+            # group_members will be updated when group_changed event is handled
+
+        for zone_player in zones_to_remove:
+            if zone_player:
+                await zone_player.power(False)
+        for zone_player in zones_to_add:
+            if zone_player:
+                await zone_player.power(True)
 
     async def select_source(self, source: str) -> None:
         """Handle SELECT SOURCE command on the player."""
